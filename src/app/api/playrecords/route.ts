@@ -1,0 +1,140 @@
+/* eslint-disable no-console */
+
+import { NextRequest, NextResponse } from 'next/server';
+
+import { db } from '@/lib/db';
+import { PlayRecord } from '@/lib/types';
+import { requireUser } from '@/lib/userAuth';
+import { validatePlayRecord } from '@/lib/userContentValidation';
+
+export const runtime = 'edge';
+
+export async function GET(request: NextRequest) {
+  try {
+    // M1: 统一走 requireUser 自验会话签名，不再只信任 Cookie 里的用户名
+    const auth = await requireUser(request);
+    if (auth.error) return auth.error;
+    const username = auth.username;
+
+    const records = await db.getAllPlayRecords(username);
+    return NextResponse.json(records, { status: 200 });
+  } catch (err) {
+    console.error('获取播放记录失败', err);
+    return NextResponse.json(
+      { error: 'Internal Server Error' },
+      { status: 500 }
+    );
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    // M1: 统一走 requireUser 自验会话签名，不再只信任 Cookie 里的用户名
+    const auth = await requireUser(request);
+    if (auth.error) return auth.error;
+    const username = auth.username;
+
+    const body = await request.json();
+    const { key, record }: { key: string; record: PlayRecord } = body;
+
+    if (!key || !record) {
+      return NextResponse.json(
+        { error: 'Missing key or record' },
+        { status: 400 }
+      );
+    }
+
+    // L5: 验证字段类型与长度上限（index 必须为整数且 >= 1，旧实现
+    // `record.index < 1` 在 index 为 undefined 时为 false，可绕过校验）
+    const recordError = validatePlayRecord(record);
+    if (recordError) {
+      return NextResponse.json({ error: recordError }, { status: 400 });
+    }
+
+    // 从key中解析source和id
+    const [source, id] = key.split('+');
+    if (!source || !id) {
+      return NextResponse.json(
+        { error: 'Invalid key format' },
+        { status: 400 }
+      );
+    }
+
+    const finalRecord = {
+      ...record,
+      save_time: record.save_time ?? Date.now(),
+    } as PlayRecord;
+
+    await db.savePlayRecord(username, source, id, finalRecord);
+
+    return NextResponse.json({ success: true }, { status: 200 });
+  } catch (err) {
+    console.error('保存播放记录失败', err);
+    return NextResponse.json(
+      { error: 'Internal Server Error' },
+      { status: 500 }
+    );
+  }
+}
+
+export async function DELETE(request: NextRequest) {
+  try {
+    // M1: 统一走 requireUser 自验会话签名，不再只信任 Cookie 里的用户名
+    const auth = await requireUser(request);
+    if (auth.error) return auth.error;
+    const username = auth.username;
+
+    const { searchParams } = new URL(request.url);
+    const key = searchParams.get('key');
+
+    if (key) {
+      // 如果提供了 key，删除单条播放记录
+      const [source, id] = key.split('+');
+      if (!source || !id) {
+        return NextResponse.json(
+          { error: 'Invalid key format' },
+          { status: 400 }
+        );
+      }
+
+      await db.deletePlayRecord(username, source, id);
+    } else {
+      // 未提供 key，则清空全部播放记录
+      // 目前 DbManager 没有对应方法，这里直接遍历删除；分批（每批 5 并发，
+      // 与收藏清空、cron 批处理同口径）+ allSettled 汇总——旧实现 Promise.all
+      // 无界扇出，任一失败即整单 500、局部已删被掩盖。深查第 19 轮。
+      const all = await db.getAllPlayRecords(username);
+      const keys = Object.keys(all);
+      let deleted = 0;
+      let failed = 0;
+      const CONCURRENCY = 5;
+      for (let i = 0; i < keys.length; i += CONCURRENCY) {
+        const batch = keys.slice(i, i + CONCURRENCY);
+        const settled = await Promise.allSettled(
+          batch.map(async (k) => {
+            const [s, i] = k.split('+');
+            if (!s || !i) return false; // 无效键不删除、不计数
+            await db.deletePlayRecord(username, s, i);
+            return true;
+          })
+        );
+        for (const r of settled) {
+          if (r.status === 'fulfilled' && r.value) deleted += 1;
+          else if (r.status === 'rejected') failed += 1;
+        }
+      }
+      return NextResponse.json(
+        { success: true, deleted, failed },
+        { status: 200 }
+      );
+    }
+
+    return NextResponse.json({ success: true }, { status: 200 });
+  } catch (err) {
+    console.error('删除播放记录失败', err);
+    return NextResponse.json(
+      { error: 'Internal Server Error' },
+      { status: 500 }
+    );
+  }
+}

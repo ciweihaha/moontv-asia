@@ -1,0 +1,304 @@
+import { NextRequest } from 'next/server';
+
+/**
+ * QUALITY-R3: HMAC-SHA256 签名（原在 login/register 路由中重复定义，现集中到此）。
+ */
+export async function generateSignature(
+  data: string,
+  secret: string
+): Promise<string> {
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(secret);
+  const messageData = encoder.encode(data);
+
+  const key = await crypto.subtle.importKey(
+    'raw',
+    keyData,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+
+  const signature = await crypto.subtle.sign('HMAC', key, messageData);
+
+  return Array.from(new Uint8Array(signature))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+/** HMAC 签名验证（原在 middleware.ts，AUDIT-R2 集中到此复用） */
+export async function verifyHmacSignature(
+  data: string,
+  signature: string,
+  secret: string
+): Promise<boolean> {
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(secret);
+  const messageData = encoder.encode(data);
+
+  try {
+    const key = await crypto.subtle.importKey(
+      'raw',
+      keyData,
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['verify']
+    );
+
+    const signatureBuffer = new Uint8Array(
+      signature.match(/.{1,2}/g)?.map((byte) => parseInt(byte, 16)) || []
+    );
+
+    return await crypto.subtle.verify(
+      'HMAC',
+      key,
+      signatureBuffer,
+      messageData
+    );
+  } catch {
+    return false;
+  }
+}
+
+export interface AuthCookieData {
+  password?: string;
+  username?: string;
+  signature?: string;
+  timestamp?: number;
+  role?: 'owner' | 'admin' | 'user';
+}
+
+/** 解析 auth Cookie 原始值（服务端用，供 NextRequest / 普通 Request 复用） */
+export function parseAuthCookieValue(
+  value: string | undefined | null
+): AuthCookieData | null {
+  if (!value) return null;
+  try {
+    let decoded = decodeURIComponent(value);
+    // 处理可能的双重编码
+    if (decoded.includes('%')) {
+      decoded = decodeURIComponent(decoded);
+    }
+    return JSON.parse(decoded) as AuthCookieData;
+  } catch {
+    return null;
+  }
+}
+
+// 从cookie获取认证信息 (服务端使用)
+export function getAuthInfoFromCookie(
+  request: NextRequest
+): AuthCookieData | null {
+  const authCookie = request.cookies.get('auth');
+  return parseAuthCookieValue(authCookie?.value);
+}
+
+// 会话有效期：7 天（与登录 Cookie 的浏览器过期时间一致）
+export const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * 会话签名密钥。
+ * 优先使用独立的 SESSION_SECRET；未配置时的行为按环境区分：
+ *  - 生产环境（NODE_ENV === 'production'）→ 抛出错误，会话功能 fail-closed，
+ *    绝不在生产环境静默回退到登录密码做签名密钥（AUDIT-R6）。
+ *  - 非生产环境 → 回退到 PASSWORD（与历史版本行为一致，开发/兼容），
+ *    并输出一次告警提醒配置独立密钥。
+ *  - 两者都未配置 → 返回空字符串；verifyAuthSession 对空密钥直接返回 null，
+ *    即所有会话验证失败，等同于「未登录」状态，不会产生可伪造的会话。
+ * 修改密钥会使既有会话失效，轮换前需评估用户重新登录成本。
+ */
+let sessionSecretFallbackWarned = false;
+
+export function getSessionSecret(): string {
+  const configured = process.env.SESSION_SECRET;
+  if (configured) return configured;
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      '[auth] SESSION_SECRET 未配置：生产环境拒绝启动会话功能。请设置高强度随机的 ' +
+      'SESSION_SECRET（与登录密码 PASSWORD 分离）。'
+    );
+  }
+  if (!sessionSecretFallbackWarned) {
+    sessionSecretFallbackWarned = true;
+    console.warn(
+      '[auth] SESSION_SECRET 未配置，非生产环境回退使用 PASSWORD 签名会话；' +
+      '生产环境请务必配置独立的高强度随机 SESSION_SECRET。'
+    );
+  }
+  return process.env.PASSWORD || '';
+}
+
+export interface VerifiedSession {
+  username: string | null;
+  role: 'owner' | 'admin' | 'user';
+}
+
+/**
+ * H1: 是否为生产未配 SESSION_SECRET 的配置错误。调用方据此返回明确的
+ * 503 配置错误而非裸 500（登录/注册路由的 outer catch 与 middleware）。
+ */
+export function isSessionSecretConfigError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('SESSION_SECRET');
+}
+
+/**
+ * L14: 按请求协议动态决定 auth Cookie 的 secure 属性。
+ *
+ * 局域网纯 HTTP 的 Docker 自托管下，secure: true 会导致浏览器拒绝设置
+ * Cookie、登录后仍跳回登录页；HTTPS（Cloudflare Pages / HTTPS 反代）
+ * 下仍保持 secure: true。
+ * 判断：优先 x-forwarded-proto（反代透传），否则看请求 URL 协议；
+ * COOKIE_SECURE 环境变量可显式覆盖（'true'/'false'）。
+ * 注意：该头仅影响本次登录的 Cookie 属性，不做鉴权决策，伪造它只会
+ * 影响伪造者自己的 Cookie。
+ */
+export function shouldUseSecureCookie(request: NextRequest): boolean {
+  const override = process.env.COOKIE_SECURE;
+  if (override === 'true') return true;
+  if (override === 'false') return false;
+  const forwardedProto = request.headers.get('x-forwarded-proto');
+  if (forwardedProto) {
+    return forwardedProto.split(',')[0]?.trim().toLowerCase() === 'https';
+  }
+  try {
+    return new URL(request.url).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * AUDIT-R3 P0-B: 构建规范化会话签名数据。
+ * 签名必须绑定 username + role + timestamp，防止篡改时间戳绕过过期、
+ * 篡改 role 提权。格式：subject|role|timestamp
+ */
+export function buildSessionSignData(
+  subject: string,
+  role: string,
+  timestamp: number
+): string {
+  return `${subject}|${role}|${timestamp}`;
+}
+
+/**
+ * AUDIT-R3 P0-B / AUDIT-R4 P1-3: 服务端会话验证（签名 + 时间戳时效）。
+ * 顺序：先验签（不信任未验证的数据），验签通过后再检查时间戳有效期。
+ * 签名覆盖 username/role/timestamp 整体；缺失时间戳的旧 Cookie 直接拒绝。
+ *
+ * 注意：SESSION_SECRET 未配置时，非生产环境回退到 PASSWORD（兼容现有会话）；
+ * 生产环境（NODE_ENV === 'production'）直接抛错，会话功能 fail-closed。
+ * 生产环境务必配置独立的高强度随机 SESSION_SECRET，与密码验证用途分离。
+ */
+export async function verifyAuthSession(
+  authInfo: AuthCookieData | null
+): Promise<VerifiedSession | null> {
+  if (!authInfo?.signature) return null;
+
+  const secret = getSessionSecret();
+  if (!secret) return null;
+
+  // 1. 先验证签名：缺失时间戳的旧 Cookie 直接拒绝（签名需要 timestamp 参与）
+  if (typeof authInfo.timestamp !== 'number') {
+    return null;
+  }
+  const subject = authInfo.username || 'localstorage-auth';
+  const role = authInfo.role ?? 'user';
+  const signData = buildSessionSignData(subject, role, authInfo.timestamp);
+  const valid = await verifyHmacSignature(signData, authInfo.signature, secret);
+  if (!valid) return null;
+
+  // 2. 验签通过后，再检查时间戳时效（拒绝未来时间戳与过期时间戳）
+  //    注意：时间戳本身已被签名保护，攻击者无法篡改它来绕过此检查。
+  const age = Date.now() - authInfo.timestamp;
+  if (age < 0 || age > SESSION_MAX_AGE_MS) {
+    return null;
+  }
+
+  return {
+    username: authInfo.username ?? null,
+    role: role as 'owner' | 'admin' | 'user',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 客户端会话状态（AUDIT-R2 P0：替代已失效的 document.cookie 读取）
+// Cookie 现为 HttpOnly，JS 无法读取；客户端展示用的用户名/角色改为走
+// 服务端验证的 /api/auth/session 接口。以下仅用于展示与缓存分区，
+// 不做任何鉴权决策（鉴权一律走服务端 HttpOnly Cookie）。
+// ---------------------------------------------------------------------------
+
+export interface ClientSession {
+  username: string | null;
+  role: 'owner' | 'admin' | 'user' | null;
+}
+
+const CLIENT_SESSION_KEY = 'moontv.client.session';
+
+let memCachedSession: ClientSession | null | undefined = undefined;
+
+/** 异步获取会话信息（带内存缓存），客户端组件在 useEffect 中调用 */
+export async function fetchSessionInfo(): Promise<ClientSession | null> {
+  if (typeof window === 'undefined') return null;
+  if (memCachedSession !== undefined) return memCachedSession;
+  try {
+    const res = await fetch('/api/auth/session', { credentials: 'same-origin' });
+    if (!res.ok) {
+      // 深查第 13 轮：失败不进内存缓存。旧实现把失败也缓存为 null，
+      // 会话接口一次瞬时抖动（500/断网）后，本页生命周期内再也不重试，
+      // 用户明明已登录、界面却一直显示未登录，直到整页刷新；登录页
+      // 登录后刷新会话也可能撞上此次缓存。只缓存成功结果，失败留
+      // undefined（下次调用重新请求）。
+      return null;
+    }
+    const data = await res.json();
+    memCachedSession = {
+      username: data.username ?? null,
+      role: data.role ?? null,
+    };
+    try {
+      // 同步一份用户名到 localStorage，供 db.client.ts 等同步调用方使用
+      if (memCachedSession.username) {
+        window.localStorage.setItem(
+          CLIENT_SESSION_KEY,
+          JSON.stringify(memCachedSession)
+        );
+      } else {
+        window.localStorage.removeItem(CLIENT_SESSION_KEY);
+      }
+    } catch {
+      // localStorage 不可用时忽略
+    }
+    return memCachedSession;
+  } catch {
+    // 深查第 13 轮：同上，网络异常/解析失败不缓存，下次调用重试。
+    return null;
+  }
+}
+
+/** 同步读取已缓存的用户名（db.client.ts 缓存分区用）；未加载时返回 null */
+export function getSyncSessionUsername(): string | null {
+  if (typeof window === 'undefined') return null;
+  if (memCachedSession !== undefined) {
+    return memCachedSession?.username ?? null;
+  }
+  try {
+    const raw = window.localStorage.getItem(CLIENT_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as ClientSession;
+    return parsed.username ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** 登出时清理客户端会话缓存 */
+export function clearClientSession(): void {
+  memCachedSession = undefined;
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.removeItem(CLIENT_SESSION_KEY);
+    } catch {
+      // 忽略
+    }
+  }
+}

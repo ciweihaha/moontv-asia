@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 最小权限：本工作流只做构建/测试/ lint，不推送、不发版，只读即可。
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Install dependencies
+        # 仓库提交了 package-lock.json，直接 npm ci 冻结安装，保证依赖可复现。
+        # 旧流程用 pnpm 并按需临时生成锁文件，已弃用。
+        run: npm ci
+
+      - name: Test
+        # package.json 含 test 脚本（jest）：CI 执行它
+        run: npm test -- --ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+  # Pages 构建验收：CI 此前只跑 npm run build，从未跑过 Pages 发布实际
+  # 使用的 npm run pages:build（含 @cloudflare/next-on-pages 边缘适配与
+  # minify 转换），故普通 Build 通过不能单独证明 Pages 产物可用。
+  # 本 job 无密钥、与 build job 并行，以 pages:build 的退出码为闸门；
+  # 不改动任何生产部署配置与运行时代码。
+  pages-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Pages build
+        run: npm run pages:build

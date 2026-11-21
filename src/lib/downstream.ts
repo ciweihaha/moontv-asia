@@ -1,0 +1,602 @@
+import { API_CONFIG, ApiSite } from '@/lib/config';
+import { SearchResult } from '@/lib/types';
+import { cleanHtmlTags } from '@/lib/utils';
+
+import { fetchWithRetry } from './fetchRetry';
+
+interface ApiSearchItem {
+  vod_id: string;
+  vod_name: string;
+  vod_pic: string;
+  vod_remarks?: string;
+  vod_play_url?: string;
+  vod_class?: string;
+  vod_year?: string;
+  vod_content?: string;
+  vod_douban_id?: number;
+  type_name?: string;
+}
+
+// R3: 读取时字节数硬上限。content-length 响应头在分块传输（chunked）时缺失，
+// 仅靠头部检查会被绕过；此处在实际读取 body 后校验字节数，超限返回 null。
+const MAX_SEARCH_BODY_BYTES = 5 * 1024 * 1024;
+const MAX_DETAIL_BODY_BYTES = 2 * 1024 * 1024;
+
+// PERF-R1: 正则提升到模块级，避免在每条目 map 回调内重复编译
+const SEARCH_M3U8_REGEX = /\$(https?:\/\/[^"'\s]+?\.m3u8)/g;
+
+/** 从 vod_play_url 提取 m3u8 剧集链接（去重并清理）
+ * @param splitBest 为 true 时按 $$$ 分片取匹配最多的一段（第一页逻辑）；
+ *                  为 false 时直接全串匹配（翻页逻辑，保持原行为） */
+function extractSearchEpisodes(
+  vodPlayUrl: string | undefined,
+  splitBest: boolean
+): string[] {
+  // 深查第 8 轮：上游字段类型不可信，非字符串 vod_play_url 在 .split
+  // 处抛错，整源结果被拖垮；此处与 mapSearchItem 同口径直接返回 []。
+  if (!vodPlayUrl || typeof vodPlayUrl !== 'string') return [];
+  let episodes: string[] = [];
+  if (splitBest) {
+    const vod_play_url_array = vodPlayUrl.split('$$$');
+    vod_play_url_array.forEach((url: string) => {
+      // 注意：全局正则需重置 lastIndex，避免跨分片污染
+      SEARCH_M3U8_REGEX.lastIndex = 0;
+      const matches = url.match(SEARCH_M3U8_REGEX) || [];
+      if (matches.length > episodes.length) {
+        episodes = matches;
+      }
+    });
+  } else {
+    SEARCH_M3U8_REGEX.lastIndex = 0;
+    episodes = vodPlayUrl.match(SEARCH_M3U8_REGEX) || [];
+  }
+  return Array.from(new Set(episodes)).map((link: string) => {
+    link = link.substring(1); // 去掉开头的 $
+    const parenIndex = link.indexOf('(');
+    return parenIndex > 0 ? link.substring(0, parenIndex) : link;
+  });
+}
+
+/**
+ * 将上游搜索条目映射为统一 SearchResult。
+ * 深查第 8 轮：上游 JSON 完全不可信，旧实现只守卫 vod_id/vod_name 为空，
+ * 类型错位（数字/对象）的字段在 .trim()/.match()/cleanHtmlTags 内抛错，
+ * 第一页 .map 在 searchFromApiWithOutcome 外层 try 内，单条脏数据拖垮
+ * 整个源的全部结果（记 failed，甚至触发熔断）。逐字段校验/归一化：
+ * 关键字段类型不对只跳过单条（返回 null），非关键字段退化为空值。
+ * AUDIT-R5 P2 口径：导出以便单元测试（与 readBodyWithLimit 同例）。
+ */
+export function mapSearchItem(
+  item: ApiSearchItem,
+  source: string,
+  sourceName: string,
+  splitBest: boolean
+): SearchResult | null {
+  // P0-2: 脏数据守卫 - vod_id/vod_name 为空时返回 null，调用方过滤，只跳过单条
+  if (item.vod_id == null || item.vod_name == null) {
+    return null;
+  }
+  // id 接受字符串/数字，其余类型（如对象 → "[object Object]"）跳过单条
+  if (typeof item.vod_id !== 'string' && typeof item.vod_id !== 'number') {
+    return null;
+  }
+  // 标题必须为字符串：数字标题在 .trim() 处抛错是本轮主因
+  if (typeof item.vod_name !== 'string') {
+    return null;
+  }
+  const yearText = !item.vod_year
+    ? 'unknown'
+    : typeof item.vod_year === 'string'
+      ? item.vod_year.match(/\d{4}/)?.[0] || ''
+      : typeof item.vod_year === 'number'
+        ? String(item.vod_year).match(/\d{4}/)?.[0] || ''
+        : 'unknown';
+  return {
+    id: String(item.vod_id),
+    title: item.vod_name.trim().replace(/\s+/g, ' '),
+    poster: typeof item.vod_pic === 'string' ? item.vod_pic : '',
+    episodes: extractSearchEpisodes(item.vod_play_url, splitBest),
+    source,
+    source_name: sourceName,
+    class: typeof item.vod_class === 'string' ? item.vod_class : undefined,
+    year: yearText,
+    desc:
+      typeof item.vod_content === 'string'
+        ? cleanHtmlTags(item.vod_content)
+        : '',
+    type_name:
+      typeof item.type_name === 'string' ? item.type_name : undefined,
+    douban_id:
+      typeof item.vod_douban_id === 'number' ? item.vod_douban_id : undefined,
+  };
+}
+
+/**
+ * AUDIT-R4 P1-1: 流式读取响应体并做字节数硬上限。
+ * 之前先用 response.arrayBuffer() 把整个响应读入内存再检查大小，
+ * 超大响应会先占满内存。现改为逐块读取、累计字节数，
+ * 超过上限立即取消读取并返回 null，内存占用恒定为上限值。
+ *
+ * AUDIT-R5 P2: 导出以便单元测试（测试文件：src/lib/__tests__/downstream.test.ts）。
+ */
+export async function readBodyWithLimit(
+  response: Response,
+  maxBytes: number,
+  signal?: AbortSignal
+): Promise<ArrayBuffer | null> {
+  // 无 body 流的降级路径（极少数环境）
+  if (!response.body) {
+    const buf = await response.arrayBuffer();
+    return buf.byteLength > maxBytes ? null : buf;
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    for (;;) {
+      // 外部取消（整体超时）时立即停止读取
+      if (signal?.aborted) {
+        await reader.cancel().catch(() => undefined);
+        throw new DOMException('Aborted', 'AbortError');
+      }
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        // 超上限：取消上游流，不再继续读
+        await reader.cancel().catch(() => undefined);
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  // 合并分块为单个 ArrayBuffer
+  const result = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result.buffer;
+}
+
+/**
+ * 搜索结果三分语义（repo-hardening 第 5/12 项）：
+ * - ok：上游请求成功，results 可为空数组（合法零结果）；
+ * - failed：上游故障（网络异常 / 非 2xx / 响应体超限 / 解析失败 / 结构异常）；
+ * - cancelled：被外部信号取消（如搜索整体超时）——三态本身仍区分
+ *   取消与失败；聚合层是否记熔断按各自计数规则（upstreamSearch 把
+ *   总截止时在途的组记失败，见其注释；searchOne 同口径）。
+ * 旧实现把三者全部吞成 []，导致路由层无法区分、故障源被误记成功而永不熔断。
+ *
+ * HARDENING-001 M-02 的类型化错误与上述三分语义是同一契约的两种形态：
+ * searchFromApiWithOutcome 以返回值区分三态；searchFromApi（见文件下方
+ * 适配层）以「resolve=ok / 抛 SearchUpstreamError=failed / 抛 AbortError=
+ * cancelled」表达同一语义，供熔断感知的聚合层（upstreamSearch）使用。
+ */
+export class SearchUpstreamError extends Error {
+  readonly status?: number;
+
+  constructor(message: string, status?: number) {
+    super(message);
+    this.name = 'SearchUpstreamError';
+    this.status = status;
+  }
+}
+
+export type SearchOutcome =
+  | { status: 'ok'; results: SearchResult[] }
+  | { status: 'failed' }
+  | { status: 'cancelled' };
+
+export async function searchFromApiWithOutcome(
+  apiSite: ApiSite,
+  query: string,
+  // PERF-R1: 由调用方一次性传入，避免每次搜索对每个上游重复读取配置（44 次/搜索）
+  maxSearchPages: number = 2,
+  // AUDIT-R3 P1: 外部取消信号（搜索整体超时时取消后台请求）
+  signal?: AbortSignal
+): Promise<SearchOutcome> {
+  // 取消的唯一判据：外部信号已中止。fetchWithRetry 内部单次超时产生的
+  // AbortError 不算取消（那是上游故障，应记 failed）。
+  const cancelled = (): SearchOutcome => ({ status: 'cancelled' });
+  try {
+    if (signal?.aborted) return cancelled();
+    const apiBaseUrl = apiSite.api;
+    const apiUrl =
+      apiBaseUrl + API_CONFIG.search.path + encodeURIComponent(query);
+    const apiName = apiSite.name;
+
+    // S3: 超时 + 指数退避重试（8s 单次超时，1 次重试）
+    const response = await fetchWithRetry(
+      apiUrl,
+      { headers: API_CONFIG.search.headers, signal },
+      { timeoutMs: 8000, retries: 1 }
+    );
+
+    // R3: 响应头 content-length 只是快速预检；分块传输时头部缺失，
+    // 读取时再做字节数硬上限，防止超大响应占满内存。
+    // 语义修正：超限是上游异常输出，记 failed 而非冒充零结果。
+    const contentLength = response.headers.get('content-length');
+    if (contentLength && parseInt(contentLength, 10) > MAX_SEARCH_BODY_BYTES) {
+      await response.body?.cancel().catch(() => {});
+      return { status: 'failed' };
+    }
+
+    if (!response.ok) {
+      // 与超限分支一致：丢弃响应前先 cancel 释放连接，吞取消异常
+      await response.body?.cancel().catch(() => {});
+      return { status: 'failed' };
+    }
+
+    const searchBody = await readBodyWithLimit(
+      response,
+      MAX_SEARCH_BODY_BYTES,
+      signal
+    );
+    if (searchBody === null) {
+      return { status: 'failed' };
+    }
+    const data = JSON.parse(new TextDecoder().decode(searchBody));
+    if (!data || !Array.isArray(data.list)) {
+      // 结构异常（无 list 数组）属于上游故障，与合法空结果区分
+      return { status: 'failed' };
+    }
+    if (data.list.length === 0) {
+      // 合法零结果：请求成功，只是没有匹配条目
+      return { status: 'ok', results: [] };
+    }
+    // 处理第一页结果（PERF-R1: 复用模块级 mapSearchItem，避免重复代码）
+    const results = data.list
+      .map((item: ApiSearchItem) =>
+        mapSearchItem(item, apiSite.key, apiName, true)
+      )
+      .filter(Boolean) as SearchResult[];
+
+    // PERF-R1: 最大页数由调用方传入，不再每次重复读取配置
+    const MAX_SEARCH_PAGES: number = maxSearchPages;
+
+    // 获取总页数
+    const pageCount = data.pagecount || 1;
+    // 确定需要获取的额外页数
+    const pagesToFetch = Math.min(pageCount - 1, MAX_SEARCH_PAGES - 1);
+
+    // 如果有额外页数，获取更多页的结果
+    if (pagesToFetch > 0) {
+      const additionalPagePromises = [];
+
+      for (let page = 2; page <= pagesToFetch + 1; page++) {
+        const pageUrl =
+          apiBaseUrl +
+          API_CONFIG.search.pagePath
+            .replace('{query}', encodeURIComponent(query))
+            .replace('{page}', page.toString());
+
+        const pagePromise = (async () => {
+          try {
+            // R4-S7: 分页请求也加重试（之前是裸 fetch，瞬时失败直接丢页）
+            // AUDIT-R4 P1-1: 传入整体 signal，超时后分页请求也被取消
+            const pageResponse = await fetchWithRetry(
+              pageUrl,
+              { headers: API_CONFIG.search.headers, signal },
+              { timeoutMs: 8000, retries: 1 }
+            );
+
+            // R3: 响应头预检 + 读取时硬上限（防分块传输绕过）
+            // 提前返回前与第一页一致：取消响应体释放连接，吞取消异常
+            const pageCL = pageResponse.headers.get('content-length');
+            if (pageCL && parseInt(pageCL, 10) > MAX_SEARCH_BODY_BYTES) {
+              await pageResponse.body?.cancel().catch(() => {});
+              return [];
+            }
+
+            if (!pageResponse.ok) {
+              await pageResponse.body?.cancel().catch(() => {});
+              return [];
+            }
+
+            const pageBody = await readBodyWithLimit(
+              pageResponse,
+              MAX_SEARCH_BODY_BYTES,
+              signal
+            );
+            if (pageBody === null) return [];
+            const pageData = JSON.parse(new TextDecoder().decode(pageBody));
+
+            if (!pageData || !pageData.list || !Array.isArray(pageData.list))
+              return [];
+
+            return pageData.list
+              .map((item: ApiSearchItem) =>
+                mapSearchItem(item, apiSite.key, apiName, false)
+              )
+              .filter(Boolean) as SearchResult[];
+          } catch {
+            return [];
+          }
+        })();
+
+        additionalPagePromises.push(pagePromise);
+      }
+
+      // 等待所有额外页的结果
+      const additionalResults = await Promise.all(additionalPagePromises);
+
+      // 合并所有页的结果
+      additionalResults.forEach((pageResults) => {
+        if (pageResults.length > 0) {
+          results.push(...pageResults);
+        }
+      });
+    }
+
+    // 分页阶段被整体取消：已拿到第一页也不冒充成功，整体记 cancelled
+    if (signal?.aborted) return cancelled();
+    return { status: 'ok', results };
+  } catch {
+    if (signal?.aborted) return cancelled();
+    return { status: 'failed' };
+  }
+}
+
+/**
+ * 适配层：保持旧签名 Promise<SearchResult[]>，但按 HARDENING-001 M-02
+ * 契约把三分语义映射为异常形态（与 searchFromApiWithOutcome 同一语义）：
+ * - ok（含合法零结果）→ resolve results；
+ * - failed → 抛 SearchUpstreamError，聚合层据此记上游失败（熔断）；
+ * - cancelled → 抛 AbortError；调用方按熔断计数规则计入（见 upstreamSearch.ts）。
+ * 现有调用方均可承受抛错：upstreamSearch / searchOne / fetchVideoDetail
+ * 的调用点都包在 try/catch 中。需要显式三态的调用方用 searchFromApiWithOutcome。
+ */
+export async function searchFromApi(
+  apiSite: ApiSite,
+  query: string,
+  maxSearchPages: number = 2,
+  signal?: AbortSignal
+): Promise<SearchResult[]> {
+  const outcome = await searchFromApiWithOutcome(
+    apiSite,
+    query,
+    maxSearchPages,
+    signal
+  );
+  if (outcome.status === 'ok') {
+    return outcome.results;
+  }
+  if (outcome.status === 'cancelled') {
+    // 取消形态：name='AbortError' 的普通 Error（不依赖 DOMException 全局，
+    // 与 fetch 的 abort 拒绝在调用方眼中不可区分；调用方以 signal 为准）
+    const abortError = new Error('Aborted');
+    abortError.name = 'AbortError';
+    throw abortError;
+  }
+  throw new SearchUpstreamError('搜索上游请求失败');
+}
+
+// 匹配 m3u8 链接的正则
+const M3U8_PATTERN = /(https?:\/\/[^"'\s]+?\.m3u8)/g;
+
+export async function getDetailFromApi(
+  apiSite: ApiSite,
+  id: string,
+  // repo-hardening 第 8 项：整体取消信号（详情路由 25s 截止 / fetchVideoDetail
+  // 15s 截止触发时真正 abort 上游，而非只让外层 race 返回错误）
+  signal?: AbortSignal
+): Promise<SearchResult> {
+  // P1-6: id 格式校验（纵深防御，与 /api/detail 路由层一致）
+  // agg 聚合源的视频 ID 带站点命名空间（形如 sync7~39605），~ 是 URL 安全字符，校验需放行
+  if (!/^[\w~-]+$/.test(id)) {
+    throw new Error('无效的视频ID格式');
+  }
+  if (apiSite.detail) {
+    return handleSpecialSourceDetail(id, apiSite, signal);
+  }
+
+  const detailUrl = `${apiSite.api}${API_CONFIG.detail.path}${id}`;
+
+  // S3: 超时 + 重试
+  const response = await fetchWithRetry(
+    detailUrl,
+    { headers: API_CONFIG.detail.headers, signal },
+    { timeoutMs: 10000, retries: 1 }
+  );
+
+  // R3: 响应头预检（详情 2MB 上限）+ 读取时硬上限（防分块传输绕过）
+  const detailCL = response.headers.get('content-length');
+  if (detailCL && parseInt(detailCL, 10) > MAX_DETAIL_BODY_BYTES) {
+    // 不读体直接返回前先 cancel，释放被 fetchRetry 跟踪的响应体/计时器
+    await response.body?.cancel().catch(() => {});
+    throw new Error('详情响应体过大');
+  }
+
+  if (!response.ok) {
+    // 深查第 10 轮：丢弃跟踪响应体前先 cancel（与超限分支/搜索路径同口径）。
+    // 旧实现直接抛错，fetchWithRetry 的跟踪流计时器与连接悬到 10s 超时
+    // 才释放；上游批量 4xx 时定时器/连接成批滞留。
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`详情请求失败: ${response.status}`);
+  }
+
+  const detailBody = await readBodyWithLimit(
+    response,
+    MAX_DETAIL_BODY_BYTES,
+    signal
+  );
+  if (detailBody === null) {
+    throw new Error('详情响应体过大');
+  }
+  const data = JSON.parse(new TextDecoder().decode(detailBody));
+
+  if (
+    !data ||
+    !data.list ||
+    !Array.isArray(data.list) ||
+    data.list.length === 0
+  ) {
+    throw new Error('获取到的详情内容无效');
+  }
+
+  const videoDetail = data.list[0];
+  // 深查第 9 轮：详情是单条目，无“跳过单条”可退，只能归一化。
+  // 旧实现直接 .split/.match/cleanHtmlTags 上游字段，类型错位（数字/
+  // 对象）时整个详情请求抛错；与第 8 轮搜索路径同口径逐字段归一化，
+  // 保持旧输入行为不变（字符串原样、空值仍为 unknown/空串）。
+  const detailPlayUrl =
+    typeof videoDetail.vod_play_url === 'string'
+      ? videoDetail.vod_play_url
+      : '';
+  const detailContent =
+    typeof videoDetail.vod_content === 'string'
+      ? videoDetail.vod_content
+      : '';
+  const detailYear = !videoDetail.vod_year
+    ? 'unknown'
+    : typeof videoDetail.vod_year === 'string'
+      ? videoDetail.vod_year.match(/\d{4}/)?.[0] || ''
+      : typeof videoDetail.vod_year === 'number'
+        ? String(videoDetail.vod_year).match(/\d{4}/)?.[0] || ''
+        : 'unknown';
+  let episodes: string[] = [];
+
+  // 处理播放源拆分
+  if (detailPlayUrl) {
+    const playSources = detailPlayUrl.split('$$$');
+    if (playSources.length > 0) {
+      const mainSource = playSources[0];
+      const episodeList = mainSource.split('#');
+      episodes = episodeList
+        .map((ep: string) => {
+          const parts = ep.split('$');
+          return parts.length > 1 ? parts[1] : '';
+        })
+        .filter(
+          (url: string) =>
+            url && (url.startsWith('http://') || url.startsWith('https://'))
+        );
+    }
+  }
+
+  // 如果播放源为空，则尝试从内容中解析 m3u8
+  if (episodes.length === 0 && detailContent) {
+    const matches = detailContent.match(M3U8_PATTERN) || [];
+    episodes = matches.map((link: string) => link.replace(/^\$/, ''));
+  }
+
+  return {
+    id: id.toString(),
+    title:
+      typeof videoDetail.vod_name === 'string'
+        ? videoDetail.vod_name
+        : String(videoDetail.vod_name ?? ''),
+    poster:
+      typeof videoDetail.vod_pic === 'string' ? videoDetail.vod_pic : '',
+    episodes,
+    source: apiSite.key,
+    source_name: apiSite.name,
+    class:
+      typeof videoDetail.vod_class === 'string'
+        ? videoDetail.vod_class
+        : undefined,
+    year: detailYear,
+    desc: cleanHtmlTags(detailContent),
+    type_name:
+      typeof videoDetail.type_name === 'string'
+        ? videoDetail.type_name
+        : undefined,
+    douban_id:
+      typeof videoDetail.vod_douban_id === 'number'
+        ? videoDetail.vod_douban_id
+        : undefined,
+  };
+}
+
+async function handleSpecialSourceDetail(
+  id: string,
+  apiSite: ApiSite,
+  signal?: AbortSignal
+): Promise<SearchResult> {
+  const detailUrl = `${apiSite.detail}/index.php/vod/detail/id/${id}.html`;
+
+  // S3: 超时 + 重试
+  const response = await fetchWithRetry(
+    detailUrl,
+    { headers: API_CONFIG.detail.headers, signal },
+    { timeoutMs: 10000, retries: 1 }
+  );
+
+  // R3: 响应头预检（详情 2MB 上限）+ 读取时硬上限（防分块传输绕过）
+  const specialCL = response.headers.get('content-length');
+  if (specialCL && parseInt(specialCL, 10) > MAX_DETAIL_BODY_BYTES) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error('详情响应体过大');
+  }
+
+  if (!response.ok) {
+    // 深查第 10 轮：与 getDetailFromApi 同口径，丢弃跟踪响应体前先 cancel。
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`详情页请求失败: ${response.status}`);
+  }
+
+  const specialBody = await readBodyWithLimit(
+    response,
+    MAX_DETAIL_BODY_BYTES,
+    signal
+  );
+  if (specialBody === null) {
+    throw new Error('详情响应体过大');
+  }
+  const html = new TextDecoder().decode(specialBody);
+  let matches: string[] = [];
+
+  if (apiSite.key === 'ffzy') {
+    const ffzyPattern =
+      /\$(https?:\/\/[^"'\s]+?\/\d{8}\/\d+_[a-f0-9]+\/index\.m3u8)/g;
+    matches = html.match(ffzyPattern) || [];
+  }
+
+  if (matches.length === 0) {
+    const generalPattern = /\$(https?:\/\/[^"'\s]+?\.m3u8)/g;
+    matches = html.match(generalPattern) || [];
+  }
+
+  // 去重并清理链接前缀
+  matches = Array.from(new Set(matches)).map((link: string) => {
+    link = link.substring(1); // 去掉开头的 $
+    const parenIndex = link.indexOf('(');
+    return parenIndex > 0 ? link.substring(0, parenIndex) : link;
+  });
+
+  // 提取标题
+  const titleMatch = html.match(/<h1[^>]*>([^<]+)<\/h1>/);
+  const titleText = titleMatch ? titleMatch[1].trim() : '';
+
+  // 提取描述
+  const descMatch = html.match(
+    /<div[^>]*class=["']sketch["'][^>]*>([\s\S]*?)<\/div>/
+  );
+  const descText = descMatch ? cleanHtmlTags(descMatch[1]) : '';
+
+  // 提取封面
+  const coverMatch = html.match(/(https?:\/\/[^"'\s]+?\.jpg)/g);
+  const coverUrl = coverMatch ? coverMatch[0].trim() : '';
+
+  // 提取年份
+  const yearMatch = html.match(/>(\d{4})</);
+  const yearText = yearMatch ? yearMatch[1] : 'unknown';
+
+  return {
+    id,
+    title: titleText,
+    poster: coverUrl,
+    episodes: matches,
+    source: apiSite.key,
+    source_name: apiSite.name,
+    class: '',
+    year: yearText,
+    desc: descText,
+    type_name: '',
+    douban_id: 0,
+  };
+}

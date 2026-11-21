@@ -1,0 +1,150 @@
+// 该文件由 scripts/convert-config.js 自动生成，请勿手动修改
+export const config = {
+  "cache_time": 9200,
+  "api_site": {
+    "lbapi9_asia": {
+      "api": "https://lbapi9.com/api.php/provide/vod",
+      "name": "乐播资源-亚洲"
+    },
+    "xingba_asia": {
+      "api": "https://xingba111.com/api.php/provide/vod",
+      "name": "杏吧资源-亚洲"
+    },
+    "jkun_asia": {
+      "api": "https://jkunzyapi.com/api.php/provide/vod",
+      "name": "JKUN资源-亚洲"
+    },
+    "shayu_asia": {
+      "api": "https://shayuapi.com/api.php/provide/vod/",
+      "name": "鲨鱼资源-亚洲"
+    },
+    "dadi_asia": {
+      "api": "https://dadiapi.com/api.php/provide/vod",
+      "name": "大地资源-亚洲"
+    },
+    "senlin_asia": {
+      "api": "https://slapibf.com/api.php/provide/vod",
+      "name": "森林资源-亚洲"
+    },
+    "fanhao_asia": {
+      "api": "https://fhapi9.com/api.php/provide/vod/",
+      "name": "番号资源-亚洲"
+    },
+    "lajiao_asia": {
+      "api": "https://apilj.com/api.php/provide/vod",
+      "name": "辣椒资源-亚洲"
+    },
+    "shileyuan_asia": {
+      "api": "https://xxavs.com/api.php/provide/vod/",
+      "name": "湿乐园-亚洲"
+    },
+    "aosika_asia": {
+      "api": "https://aosikazy.com/api.php/provide/vod",
+      "name": "奥斯卡资源-亚洲"
+    },
+    "naixiang_asia": {
+      "api": "https://naixxzy.com/api.php/provide/vod/",
+      "name": "奶香香资源-亚洲"
+    },
+    "didi_asia": {
+      "api": "https://api.ddapi.cc/api.php/provide/vod/",
+      "name": "滴滴资源-亚洲"
+    },
+    "adult18_asia": {
+      "api": "https://91md.me/api.php/provide/vod",
+      "name": "成人18+-亚洲"
+    },
+    "yuenan_asia": {
+      "api": "https://vnzyz.com/api.php/provide/vod",
+      "name": "越南资源-亚洲"
+    },
+    "ck_asia": {
+      "api": "https://ckzy.me/api.php/provide/vod/",
+      "name": "CK资源-亚洲"
+    },
+    "huanggua_asia": {
+      "api": "https://www.avre06.com/api.php/provide/vod",
+      "name": "黄瓜资源-亚洲"
+    },
+    "senanguo_asia": {
+      "api": "https://api.sexnguon.com/api.php/provide/vod/",
+      "name": "色南国资源-亚洲"
+    },
+    "aivin_asia": {
+      "api": "http://lbapiby.com/api.php/provide/vod",
+      "name": "AIvin-亚洲"
+    },
+    "putao_asia": {
+      "api": "http://api.putaozy.net/inc/apijson_vod.php",
+      "name": "葡萄资源-亚洲"
+    },
+    "feifei_asia": {
+      "api": "http://www.feifei67.com/api.php/provide/vod/",
+      "name": "菲菲资源-亚洲"
+    },
+    "maozhua_asia": {
+      "api": "https://api.maozyapi.com/inc/apijson_vod.php",
+      "name": "猫爪资源-亚洲"
+    },
+    "huakui_asia": {
+      "api": "https://caiji.huakuiapi.com/inc/apijson_vod.php",
+      "name": "花魁资源-亚洲"
+    },
+    "tt_asia": {
+      "api": "https://apittzy.com/api.php/provide/vod/",
+      "name": "TT资源-亚洲"
+    },
+    "kk_asia": {
+      "api": "https://kkzy.me/api.php/provide/vod/",
+      "name": "KK资源-亚洲"
+    },
+    "sewo_asia": {
+      "api": "https://sewozyapi.com/api.php/provide/vod/",
+      "name": "色窝资源-亚洲"
+    },
+    "ali_asia": {
+      "api": "https://api.apilyzy.com/api.php/provide/vod/",
+      "name": "阿狸资源-亚洲"
+    },
+    "jiuyijingpin_asia": {
+      "api": "https://91jpzyw.com/api.php/provide/vod",
+      "name": "91精品资源-亚洲"
+    },
+    "wukong_asia": {
+      "api": "https://wukongzyz.com/api.php/provide/vod",
+      "name": "悟空资源-亚洲"
+    },
+    "xingziyuan_asia": {
+      "api": "https://xzybb1.com/api.php/provide/vod",
+      "name": "杏资源站-亚洲"
+    },
+    "yinwo_asia": {
+      "api": "https://api.yinwoapi.com/api.php/provide/vod/",
+      "name": "淫窝资源-亚洲"
+    },
+    "sishi_asia": {
+      "api": "https://www.4000zy.com/inc/apijson_vod.php",
+      "name": "4000资源-亚洲"
+    },
+    "yinlong_asia": {
+      "api": "https://yinlong.tv/api.php/provide/vod/",
+      "name": "银龙资源-亚洲"
+    },
+    "naicha_asia": {
+      "api": "https://caiji.naichaapi.com/inc/apijson_vod.php",
+      "name": "奶茶资源-亚洲"
+    },
+    "aibo_asia": {
+      "api": "https://cj.apiabzy.com/api.php/provide/vod/",
+      "name": "爱播资源-亚洲"
+    },
+    "huajiao_asia": {
+      "api": "https://apihjzy.com/api.php/provide/vod/",
+      "name": "花椒资源-亚洲"
+    }
+  }
+} as const;
+
+export type RuntimeConfig = typeof config;
+
+export default config;
