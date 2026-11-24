@@ -93,6 +93,9 @@ jest.mock('@/lib/config', () => ({
     { key: 'src1', name: '源1', api: 'https://a.example/api.php' },
   ],
   getCacheTime: async () => 300,
+  // 亚洲站 route 的黄色词过滤分支会调用 getConfig（母仓 moontv-my 无此分支，
+  // 测试自母仓搬来时漏 mock），缺失时 TypeError 被 catch 吞掉，GET 返回 500。
+  getConfig: async () => ({ SiteConfig: { DisableYellowFilter: true } }),
 }));
 
 jest.mock('@/lib/detailCache', () => ({
@@ -119,6 +122,8 @@ jest.mock('@/lib/downstream', () => ({
 }));
 
 jest.mock('@/lib/errorReport', () => ({ reportError: () => undefined }));
+
+jest.mock('@/lib/yellow', () => ({ containsYellow: () => false }));
 
 let GET: (request: Request) => Promise<Response>;
 beforeAll(async () => {
