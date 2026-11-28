@@ -10,75 +10,6 @@ export const runtime = 'edge';
 // OrionTV 兼容接口（从旧 MoonTV 移植，已修复 SSRF）
 // 用途：代理豆瓣等图床的图片，解决防盗链导致的海报黑屏
 
-// round2 F1: edge allowlist
-// Initial list: hostnames of api fields in config.json api_site, deduplicated.
-// Non-listed hostname returns 403 before any fetch.
-// 2026-10-25 OrionTV 海报回归，豆瓣封面来自 img*.doubanio.com，不在 api 域名表里导致全 403，只放行 doubanio 公共图床后缀，仍走后面的 DNS 校验与内网拦截。
-// 2026-10-31 海报全量 403 修复：采集 API 返回的 vod_pic 全部托管在独立图床 CDN（youkupic/jinyingimage/ppqrrs 等），
-// 不在 api 域名表里导致所有海报 403。实测聚合接口全库采样得到下列 16 个图床域，按「域名家族后缀」放行
-// （子域名会轮换，如 v10/v11.ppqrrs.com、pic/pic3），仍逐跳走 DNS 校验与内网拦截，SSRF 防护不变。
-const ALLOWED_IMAGE_HOSTNAME_SUFFIXES = [
-  '.doubanio.com',
-  // 2026-10-31 新增：采集站点公共图床（按后缀放行，覆盖子域名轮换）
-  '.youkupic.com',
-  '.jinyingimage.com',
-  '.guangsuimage.com',
-  '.jisuimage.com',
-  '.lzipic.com',
-  '.ukuapi88.com',
-  '.ppqrrs.com',
-  '.yzzyimg.online',
-  '.mdzypic.com',
-  '.hongniuzyimage.com',
-  '.huyajs.com',
-  '.jegms.com',
-  '.xltupian.com',
-  '.bfvp26.com',
-];
-function isAllowedImageHostname(hostname: string): boolean {
-    const h = hostname.toLowerCase();
-    if (ALLOWED_IMAGE_HOSTNAMES.has(h)) return true;
-    return ALLOWED_IMAGE_HOSTNAME_SUFFIXES.some((suffix) => h.endsWith(suffix));
-}
-const ALLOWED_IMAGE_HOSTNAMES = new Set([
-  'api.guangsuapi.com',
-  'api.xinlangapi.com',
-  'api.wujinapi.me',
-  'api.wujinapi.net',
-  'api.1080zyku.com',
-  'www.huyaapi.com',
-  'hhzyapi.com',
-  'subocaiji.com',
-  'cj.lziapi.com',
-  'jinyingzy.com',
-  'jyzyapi.com',
-  'cj.ffzyapi.com',
-  'caiji.moduapi.cc',
-  'www.mdzyapi.com',
-  'api.ffzyapi.com',
-  'jszyapi.com',
-  'www.hongniuzy3.com',
-  'api.ukuapi88.com',
-  'api.wujinapi.cc',
-  '360zy.com',
-  'api.ukuapi.com',
-  'ikunzyapi.com',
-  'cj.rycjapi.com',
-  'api.wujinapi.com',
-  'bfzyapi.com',
-  'zuidazy.me',
-  'm3u8.apiyhzy.com',
-  'caiji.dyttzyapi.com',
-  'www.hongniuzy2.com',
-  'www.moduzy.com',
-  // 2026-10-31 新增：无子域名/特殊前缀的图床裸域（endsWith 后缀匹配不含裸域，需精确条目）
-  'hongniuzyimage.com',
-  'ynztctv.com',
-  // 2026-10-31 新增：自建聚合服务域名（部分数据源的 vod_pic 已封装为聚合站图片代理 URL）
-  'ysp.ciweihaha.win',
-  'live.ciweihaha.win',
-]);
-
 // 允许的图片 Content-Type
 const ALLOWED_CONTENT_TYPES = [
   'image/jpeg',
@@ -377,10 +308,8 @@ async function validateUrlForFetch(
     return { ok: false, error: 'Blocked host', status: 403 };
   }
   // AUDIT-R5 P1: DNS 解析结果检查（2026-10-19 方案 B：未知拒绝，仅全公网记录放行）
-  // round2 F1: edge allowlist, fail-closed, before DNS/fetch.
-  if (!isAllowedImageHostname(parsed.hostname)) {
-    return { ok: false, error: 'Host not allowed', status: 403 };
-  }
+  // 2026-11-29: 亚洲站图片 CDN 域名轮换频繁，白名单维护不过来导致海报全 403；
+  // 去掉主机白名单，保留 isBlockedHost + DNS 全公网校验 + Content-Type 检查，SSRF 防护不变。
   const dnsCheck = await validateHostnameDNS(parsed.hostname);
   if (!dnsCheck.ok) {
     return { ok: false, error: 'DNS check failed', status: 403 };
